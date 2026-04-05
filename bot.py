@@ -1,56 +1,105 @@
-import os
-import feedparser
 import asyncio
+import pandas as pd
+import yfinance as yf
 from telegram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from dotenv import load_dotenv
 
-# Carica variabili da .env
-load_dotenv()
+# ==========================
+# CONFIG BOT TELEGRAM
+# ==========================
+TOKEN = "8624709220:AAE2-u1ZlO205PY85K_rxnDFTv1d6DIx57U"
+CHAT_ID = "5921119236"
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-RSS_URL = os.getenv("RSS_URL")  # Esempio: Google News RSS
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))  # default 60 secondi
+# ==========================
+# CONFIG ASSET
+# ==========================
+SYMBOL = "EURUSD=X"   # cambia in "XAUUSD=X" per oro, "BTC-USD" per crypto
+TIMEFRAME = "1h"      # intervallo di controllo dati
+PERIOD = "60d"        # quanti giorni di dati prendere
 
 bot = Bot(token=TOKEN)
-sent_links = set()
+last_signal = None
 
-# Keywords per filtraggio
-KEYWORDS = [
-    "missile", "attacco", "esplosione",
-    "nato", "drone", "russia", "ukraine",
-    "gaza", "israel", "iran"
-]
+# ==========================
+# FUNZIONI
+# ==========================
+def get_data():
+    """Scarica dati da Yahoo Finance"""
+    df = yf.download(
+        SYMBOL,
+        period=PERIOD,
+        interval=TIMEFRAME,
+        progress=False
+    )
+    if df.empty:
+        print(f"⚠️ Nessun dato ricevuto per {SYMBOL}")
+    return df
 
-async def check_news():
-    feed = feedparser.parse(RSS_URL)
+def generate_signal(df):
+    """Genera segnali BUY/SELL basati su EMA e RSI"""
+    if df.empty:
+        return None
 
-    for entry in feed.entries[:10]:
-        link = entry.link
+    # EMA
+    df["ema50"] = df["Close"].ewm(span=50).mean()
+    df["ema200"] = df["Close"].ewm(span=200).mean()
 
-        if link in sent_links:
-            continue
+    # RSI
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss
+    df["rsi"] = 100 - (100 / (1 + rs))
 
-        title_lower = entry.title.lower()
-        if not any(k in title_lower for k in KEYWORDS):
-            continue
+    last = df.iloc[-1]
+    price = float(last["Close"])
+    rsi = float(last["rsi"])
 
-        sent_links.add(link)
-        message = f"🚨 *ULTIMA NOTIZIA GUERRA*\n\n*{entry.title}*\n🔗 {link}"
+    # calcolo SL/TP
+    sl_tp_pips = 0.0060 if "USD" in SYMBOL else 0.03  # forex vs altri
 
-        try:
-            await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
-            print(f"Inviata notizia: {entry.title}")
-        except Exception as e:
-            print(f"Errore invio notizia: {e}")
+    if last["ema50"] > last["ema200"] and rsi < 35:
+        sl = round(price - sl_tp_pips, 5)
+        tp = round(price + sl_tp_pips*2, 5)
+        return "BUY", price, sl, tp, rsi
+
+    if last["ema50"] < last["ema200"] and rsi > 65:
+        sl = round(price + sl_tp_pips, 5)
+        tp = round(price - sl_tp_pips*2, 5)
+        return "SELL", price, sl, tp, rsi
+
+    return None
+
+async def check_market():
+    """Controlla il mercato e invia segnali su Telegram"""
+    global last_signal
+    df = get_data()
+    signal = generate_signal(df)
+    if not signal:
+        return
+
+    side, price, sl, tp, rsi = signal
+    unique = f"{side}-{price}"
+    if unique == last_signal:
+        return  # evita duplicati
+    last_signal = unique
+
+    msg = (
+        f"📊 {SYMBOL} SIGNAL\n"
+        f"{'🟢 BUY' if side=='BUY' else '🔴 SELL'}\n"
+        f"Entry: {price}\nSL: {sl}\nTP: {tp}\nRSI: {round(rsi,2)}"
+    )
+    await bot.send_message(chat_id=CHAT_ID, text=msg)
 
 async def main():
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(check_news, "interval", seconds=CHECK_INTERVAL)
+    scheduler.add_job(check_market, "interval", minutes=15)
     scheduler.start()
-    print("Bot avviato...")
-    await asyncio.Event().wait()
+    await bot.send_message(chat_id=CHAT_ID, text=f"✅ Bot {SYMBOL} avviato")
+    await asyncio.Event().wait()  # mantiene il bot attivo
 
+# ==========================
+# AVVIO BOT
+# ==========================
 if __name__ == "__main__":
     asyncio.run(main())
